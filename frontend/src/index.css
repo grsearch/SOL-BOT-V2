@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background: #0b0d12;
+  color: #e6e8ee;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0b0d12; }
+::-webkit-scrollbar-thumb { background: #262936; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3e52; }
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

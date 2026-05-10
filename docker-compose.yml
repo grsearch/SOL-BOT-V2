@@ -1,0 +1,37 @@
+services:
+  backend:
+    build: ./backend
+    container_name: sol-bot-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      DATABASE_PATH: /app/data/data.db
+      # 容器内启动时不能用交互式输入密码，必须显式提供
+      # 强烈建议通过 docker secret 或外部 KMS 注入而不是直接写在 .env
+    volumes:
+      - ./data:/app/data                        # SQLite + keystore 持久化
+      - ./backend/wallet.keystore.json:/app/wallet.keystore.json:ro
+    expose:
+      - "3001"
+    # 仅在你的服务器需要直接暴露后端端口时打开（前端 nginx 已反代，一般不需要）
+    # ports:
+    #   - "3001:3001"
+
+  frontend:
+    build: ./frontend
+    container_name: sol-bot-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+# 注意：
+# 1. 第一次部署前，需在宿主机上先运行 backend 的 wallet:create / wallet:import
+#    生成 wallet.keystore.json 并放到项目根目录或 backend/ 目录下
+# 2. .env 中的 WALLET_PASSWORD 必须填写，否则容器启动卡住等待 stdin
+# 3. .env 中 API_TOKEN 必须填写！Docker 模式下 frontend → backend 不是 loopback，
+#    没设 API_TOKEN 前端会全部 401。同时不设 API_TOKEN 又把 8080 暴露到公网 = 任何人能调你的钱包。
+# 4. .env 和 wallet.keystore.json 不要提交到 git（.gitignore 已配）
