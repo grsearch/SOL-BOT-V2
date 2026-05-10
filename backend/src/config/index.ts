@@ -56,7 +56,7 @@ const envSchema = z.object({
   AUTO_DIP_BUY_ENABLED: z.coerce.boolean().default(true),
   AUTO_DIP_BUY_SOL: z.coerce.number().positive().default(1),
   // 触发条件：24h 跌幅 ≥ X%
-  AUTO_DIP_BUY_DROP_24H_PCT: z.coerce.number().positive().default(70),
+  AUTO_DIP_BUY_DROP_24H_PCT: z.coerce.number().positive().default(60),
   // 触发条件：15m RSI(7) < X
   AUTO_DIP_BUY_RSI_THRESHOLD: z.coerce.number().positive().default(30),
   // 补仓：相对自己上次买入价又跌 ≥ X%

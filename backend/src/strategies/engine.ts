@@ -14,12 +14,12 @@ interface RsiCache {
   fetchedAt: number;
 }
 
-// ★ 优化：RSI(7) 在 15m K 线上变化不快，5 分钟刷新一次完全够用
-const RSI_CACHE_TTL_MS = 5 * 60_000;
+// ★ RSI(7) 在 15m K 线上变化非常慢，10 分钟刷新一次完全够（一根 K 线还没走完）
+const RSI_CACHE_TTL_MS = 10 * 60_000;
 const AUTO_BUY_COOLDOWN_MS = 60_000;
 // WS 价格兜底：超过这个时间没收到 tick 就用 REST 拉一次
 // （Birdeye WS 对很多 SOL 链上小币没价格推送，必须有 REST 兜底）
-const WS_STALE_THRESHOLD_MS = 2 * 60_000;
+const WS_STALE_THRESHOLD_MS = 5 * 60_000;
 // sweep 分批：把所有活跃币分散到多个 sweep 周期里跑，避免瞬时 burst
 const SWEEP_BATCH_DIVISOR = 5;       // 每次 sweep 只跑 1/5 的币，5 轮覆盖全部
 const META_BATCH_DIVISOR = 5;        // 元数据刷新同理
@@ -103,6 +103,7 @@ class StrategyEngine {
     this.rsiCache.delete(address);
     this.autoBuyBackoff.delete(address);
     this.lastWsTickAt.delete(address);
+    this.rsiSellLastCheckAt.delete(address);
   }
 
   // ============== 价格 tick ==============
@@ -151,10 +152,19 @@ class StrategyEngine {
     }
   }
 
+  // RSI 卖出评估的节流：每币最多 30 秒检查一次（过滤热门币 WS 高频 tick）
+  private rsiSellLastCheckAt = new Map<string, number>();
+  private static readonly RSI_SELL_CHECK_INTERVAL_MS = 30_000;
+
   /** RSI(7) 15m > RSI_SELL_THRESHOLD（默认 80）→ 立即全仓卖 */
   private async evaluateRsiSell(t: Token, currentPrice: number): Promise<void> {
     const pos = positionRepo.getOpenByToken(t.address);
     if (!pos || pos.is_open === 0) return;
+
+    // 节流：30 秒内检查过就跳过（RSI 在 15m 烛上变化慢，30s 颗粒度足够）
+    const lastCheck = this.rsiSellLastCheckAt.get(t.address) ?? 0;
+    if (Date.now() - lastCheck < StrategyEngine.RSI_SELL_CHECK_INTERVAL_MS) return;
+    this.rsiSellLastCheckAt.set(t.address, Date.now());
 
     const rsi7 = await this.getRsi7Cached(t.address);
     if (rsi7 == null) return;
@@ -276,12 +286,12 @@ class StrategyEngine {
 
   // ============== 自动策略 sweep ==============
   /**
-   * 错峰分批：每次只跑总币数的 1/SWEEP_BATCH_DIVISOR，分散 OHLCV 请求峰值。
+   * 错峰分批：每次只跑总币数的 1/SWEEP_BATCH_DIVISOR，分散请求峰值。
    *
-   * 行为：
-   * 1. 对本批次的币：刷 RSI（更新缓存）+ 评估自动买入
-   * 2. 对本批次的所有币：检查 WS 是否长时间没推送，如有则 REST 拉一次价格兜底
-   *    （Birdeye WS 对很多 SOL 链上小币不推送，必须 REST 兜底，否则止盈/RSI 卖出全部失效）
+   * ★ 优化关键：RSI 完全按需获取（不再预拉）
+   *   - evaluateAutoDipBuy 里只有跌幅达标的币才会调 getRsi7Cached → 拉 OHLCV
+   *   - evaluateRsiSell 只对持仓币调用，没持仓的币永远不拉 RSI
+   *   绝大多数币既没持仓、跌幅也没到 70%，OHLCV 调用量大幅降低
    */
   private async runAutoStrategySweep(): Promise<void> {
     const tokens = tokenRepo.listActive();
@@ -295,7 +305,7 @@ class StrategyEngine {
 
     for (const t of batch) {
       try {
-        await this.refreshRsi7(t.address);
+        // 不再预拉 RSI！evaluateAutoDipBuy 内部按需拉
         await this.evaluateAutoDipBuy(t);
       } catch (e: any) {
         logger.warn({ err: e.message, addr: t.address }, 'sweep 单币失败');
@@ -410,7 +420,21 @@ class StrategyEngine {
     }
   }
 
-  // ============== 元数据刷新（错峰分批） ==============
+  // ============== 元数据刷新（错峰分批 + 智能间隔） ==============
+  /**
+   * 智能间隔：
+   * - 持仓中的币：10 分钟（涉及止盈/止损判定，要勤刷）
+   * - 已稳定的币（年龄 > 1 天，FDV > $100k，LP > $50k，无持仓）：30 分钟
+   * - 其他（新币、低市值、低 LP）：10 分钟
+   *
+   * 这样大盘币（已稳定）的 token_overview 调用降到原来的 1/3
+   */
+  private static readonly META_REFRESH_NORMAL_MS = 10 * 60_000;
+  private static readonly META_REFRESH_STABLE_MS = 30 * 60_000;
+  private static readonly STABLE_AGE_SECONDS = 86400;          // 1 天
+  private static readonly STABLE_FDV_USD = 100_000;
+  private static readonly STABLE_LP_USD = 50_000;
+
   private async runMetadataRefresh(): Promise<void> {
     const tokens = tokenRepo.listActive();
     if (tokens.length === 0) return;
@@ -420,8 +444,23 @@ class StrategyEngine {
     const batch = tokens.slice(start, start + batchSize);
     this.metaSweepIndex = (this.metaSweepIndex + 1) % META_BATCH_DIVISOR;
 
+    const now = Date.now();
     for (const t of batch) {
       try {
+        // 跳过判定：根据稳定度/持仓决定本次是否要刷
+        const lastRefresh = t.last_metadata_refresh_at ?? 0;
+        const ageMs = now - lastRefresh;
+        const hasPosition = !!positionRepo.getOpenByToken(t.address);
+        const isStable =
+          !hasPosition &&
+          (t.age_seconds ?? 0) > StrategyEngine.STABLE_AGE_SECONDS &&
+          (t.fdv_usd ?? 0) > StrategyEngine.STABLE_FDV_USD &&
+          (t.lp_usd ?? 0) > StrategyEngine.STABLE_LP_USD;
+        const requiredInterval = isStable
+          ? StrategyEngine.META_REFRESH_STABLE_MS
+          : StrategyEngine.META_REFRESH_NORMAL_MS;
+        if (ageMs < requiredInterval) continue;
+
         await refreshTokenMetadata(t.address);
       } catch (e: any) {
         logger.warn({ err: e.message, addr: t.address }, '元数据刷新单币失败');
