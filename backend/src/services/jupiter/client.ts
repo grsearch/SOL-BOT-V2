@@ -71,19 +71,27 @@ class JupiterClient {
    * 3. restrictIntermediateTokens（在 quote 里）
    * 4. dynamicComputeUnitLimit: true - 自动算 CU
    * 5. MEV protection: 走 Jito 私有内存池（如果配置了 JITO_TIP_LAMPORTS > 0）
+   *
+   * @param overrides 重试时可覆盖默认费用配置
    */
-  async executeSwap(quote: QuoteResponse): Promise<SwapResult> {
+  async executeSwap(
+    quote: QuoteResponse,
+    overrides?: {
+      jitoTipLamports?: number;
+      priorityFeeLamports?: number;
+    },
+  ): Promise<SwapResult> {
     if (!wallet.isUnlocked) throw new Error('钱包未解锁，无法执行交易');
 
-    const useMev = config.JITO_TIP_LAMPORTS > 0;
+    const jitoTip = overrides?.jitoTipLamports ?? config.JITO_TIP_LAMPORTS;
+    const priorityFeeMax = overrides?.priorityFeeLamports ?? config.DEFAULT_PRIORITY_FEE_LAMPORTS;
+    const useMev = jitoTip > 0;
 
     // ★ BUG #12 修：以用户/quote 指定的 slippageBps 为上限，不被 DEFAULT 反向放大
     const dynamicSlippageMaxBps = quote.slippageBps;
 
     // ★ BUG #2 修：/swap 接口不支持同时设置 priorityLevel 和 jitoTipLamports
-    // 见 Jupiter 文档：https://github.com/jup-ag/jupiter-quote-api-node/blob/main/swagger.yaml
-    // "If you want to include both, you will need to use /swap-instructions"
-    // MEV 模式下只用 jitoTipLamports（tip 本身就构成优先级）；非 MEV 模式才用 priorityLevel。
+    // MEV 模式下只用 jitoTipLamports；非 MEV 模式才用 priorityLevel。
     const swapBody: Record<string, any> = {
       userPublicKey: wallet.address,
       quoteResponse: quote,
@@ -91,11 +99,11 @@ class JupiterClient {
       dynamicComputeUnitLimit: true,
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: useMev
-        ? { jitoTipLamports: config.JITO_TIP_LAMPORTS }
+        ? { jitoTipLamports: jitoTip }
         : {
             priorityLevelWithMaxLamports: {
               priorityLevel: 'veryHigh',
-              maxLamports: config.DEFAULT_PRIORITY_FEE_LAMPORTS,
+              maxLamports: priorityFeeMax,
             },
           },
     };
@@ -122,19 +130,19 @@ class JupiterClient {
     // 发送
     const rawTx = tx.serialize();
     const signature = await wallet.conn.sendRawTransaction(rawTx, {
-      skipPreflight: true,    // 已经 simulate 过，跳过 preflight 加速
+      skipPreflight: true,
       maxRetries: 3,
       preflightCommitment: 'confirmed',
     });
 
-    logger.info({ signature, useMev }, 'Swap 已提交');
+    logger.info({ signature, useMev, jitoTip, priorityFeeMax }, 'Swap 已提交');
 
     return {
       signature,
       inAmountRaw: quote.inAmount,
       outAmountRaw: quote.outAmount,
       slippageBpsUsed: quote.slippageBps,
-      priorityFeeLamports: data.prioritizationFeeLamports ?? config.DEFAULT_PRIORITY_FEE_LAMPORTS,
+      priorityFeeLamports: data.prioritizationFeeLamports ?? priorityFeeMax,
       computeUnitLimit: data.computeUnitLimit,
     };
   }

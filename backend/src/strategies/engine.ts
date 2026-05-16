@@ -4,25 +4,29 @@ import { priceStream, type PriceTick } from '../services/birdeye/wsPrice.js';
 import { tokenRepo, positionRepo, alertRepo } from '../db/repo.js';
 import { buyToken, sellToken } from '../services/jupiter/executor.js';
 import { refreshTokenMetadata, estimateHigh24hFromOverview } from './metadata.js';
-import { birdeye } from '../services/birdeye/client.js';
+import { birdeye, type OhlcvCandle } from '../services/birdeye/client.js';
 import { rsi } from '../utils/rsi.js';
 import type { Token } from '../types/index.js';
 
-// 单个币的 RSI 缓存（避免每个 price tick 都重新拉 OHLCV）
-interface RsiCache {
+// OHLCV 缓存：同一份 K 线数据同时给 RSI 计算和价格稳定度判定使用
+interface OhlcvCache {
+  candles: OhlcvCandle[];
   rsi7: number | null;
   fetchedAt: number;
 }
 
 // ★ RSI(7) 在 15m K 线上变化非常慢，10 分钟刷新一次完全够（一根 K 线还没走完）
-const RSI_CACHE_TTL_MS = 10 * 60_000;
+const OHLCV_CACHE_TTL_MS = 10 * 60_000;
 const AUTO_BUY_COOLDOWN_MS = 60_000;
 // WS 价格兜底：超过这个时间没收到 tick 就用 REST 拉一次
-// （Birdeye WS 对很多 SOL 链上小币没价格推送，必须有 REST 兜底）
 const WS_STALE_THRESHOLD_MS = 5 * 60_000;
-// sweep 分批：把所有活跃币分散到多个 sweep 周期里跑，避免瞬时 burst
-const SWEEP_BATCH_DIVISOR = 5;       // 每次 sweep 只跑 1/5 的币，5 轮覆盖全部
-const META_BATCH_DIVISOR = 5;        // 元数据刷新同理
+// sweep 分批
+const SWEEP_BATCH_DIVISOR = 5;
+const META_BATCH_DIVISOR = 5;
+
+// 防接飞刀：最近 N 根 15m K 线里，单根跌幅 > X% 视为"大阴线"
+const STABILITY_CHECK_BARS = 3;
+const STABILITY_BIG_RED_DROP_PCT = 15;
 
 class StrategyEngine {
   private monitorTimer: NodeJS.Timeout | null = null;
@@ -32,14 +36,14 @@ class StrategyEngine {
 
   private isProcessingPrice = new Set<string>();
   private isAutoBuying = new Set<string>();
-  private rsiCache = new Map<string, RsiCache>();
+  private ohlcvCache = new Map<string, OhlcvCache>();
   private autoBuyBackoff = new Map<string, number>();
 
-  // 错峰索引（每次 sweep 只跑一部分币）
+  // 错峰索引
   private sweepIndex = 0;
   private metaSweepIndex = 0;
 
-  // ★ WS 兜底：每个币最近一次收到 WS tick 的时间
+  // WS 兜底
   private lastWsTickAt = new Map<string, number>();
 
   start(): void {
@@ -100,7 +104,7 @@ class StrategyEngine {
 
   unsubscribeToken(address: string): void {
     priceStream.unsubscribe(address);
-    this.rsiCache.delete(address);
+    this.ohlcvCache.delete(address);
     this.autoBuyBackoff.delete(address);
     this.lastWsTickAt.delete(address);
     this.rsiSellLastCheckAt.delete(address);
@@ -229,6 +233,16 @@ class StrategyEngine {
       if (rsi7 == null) return;
       if (rsi7 >= config.AUTO_DIP_BUY_RSI_THRESHOLD) return;
 
+      // ★ 防接飞刀：最近 3 根 15m K 线不能有大阴线（跌幅 > 15%）
+      const stable = await this.isPriceStable(t.address);
+      if (stable !== true) {
+        logger.info({
+          token: t.symbol, dropPct: dropPct.toFixed(1) + '%', rsi7,
+          stable: stable === null ? '数据不足' : '不稳定',
+        }, '触发条件满足但价格不稳定，跳过买入');
+        return;
+      }
+
       // 触发首次买入
       logger.info({
         token: t.symbol, refHigh, currentPrice, dropPct: dropPct.toFixed(1) + '%', rsi7,
@@ -260,6 +274,16 @@ class StrategyEngine {
     const rsi7 = await this.getRsi7Cached(t.address);
     if (rsi7 == null) return;
     if (rsi7 >= config.AUTO_DIP_BUY_RSI_THRESHOLD) return;
+
+    // ★ 防接飞刀：DCA 同样要求价格已企稳
+    const stable = await this.isPriceStable(t.address);
+    if (stable !== true) {
+      logger.info({
+        token: t.symbol, dcaDropPct: dcaDropPct.toFixed(1) + '%', rsi7,
+        stable: stable === null ? '数据不足' : '不稳定',
+      }, 'DCA 条件满足但价格不稳定，跳过');
+      return;
+    }
 
     logger.info({
       token: t.symbol, lastBuyPrice, currentPrice, dcaDropPct: dcaDropPct.toFixed(1) + '%', rsi7,
@@ -357,30 +381,66 @@ class StrategyEngine {
     }
   }
 
-  // ============== RSI 拉取/缓存 ==============
-  private async getRsi7Cached(address: string): Promise<number | null> {
-    const cached = this.rsiCache.get(address);
-    if (cached && Date.now() - cached.fetchedAt < RSI_CACHE_TTL_MS) {
-      return cached.rsi7;
+  // ============== OHLCV + RSI 拉取/缓存 ==============
+  private async getOhlcvCached(address: string): Promise<OhlcvCache | null> {
+    const cached = this.ohlcvCache.get(address);
+    if (cached && Date.now() - cached.fetchedAt < OHLCV_CACHE_TTL_MS) {
+      return cached;
     }
-    return await this.refreshRsi7(address);
+    return await this.refreshOhlcv(address);
   }
 
-  private async refreshRsi7(address: string): Promise<number | null> {
-    // RSI(7) 需要至少 8 根 K 线，多拉一些缓冲
+  private async refreshOhlcv(address: string): Promise<OhlcvCache | null> {
+    // RSI(7) 需要至少 8 根 K 线，价格稳定度判定要至少 3-4 根，统一拉 30 根足够
     const candles = await birdeye.getOhlcv(address, { type: '15m', limit: 30 });
     if (candles.length < 8) {
-      this.rsiCache.set(address, { rsi7: null, fetchedAt: Date.now() });
-      return null;
+      const entry: OhlcvCache = { candles, rsi7: null, fetchedAt: Date.now() };
+      this.ohlcvCache.set(address, entry);
+      return entry;
     }
     const closes = candles.map((c) => c.c).filter((p) => p > 0);
-    if (closes.length < 8) {
-      this.rsiCache.set(address, { rsi7: null, fetchedAt: Date.now() });
-      return null;
+    let rsi7Val: number | null = null;
+    if (closes.length >= 8) rsi7Val = rsi(closes, 7);
+    const entry: OhlcvCache = { candles, rsi7: rsi7Val, fetchedAt: Date.now() };
+    this.ohlcvCache.set(address, entry);
+    return entry;
+  }
+
+  /** 兼容旧的 getRsi7Cached 接口 */
+  private async getRsi7Cached(address: string): Promise<number | null> {
+    const c = await this.getOhlcvCached(address);
+    return c?.rsi7 ?? null;
+  }
+
+  /**
+   * 价格稳定度判定（防接飞刀）：
+   * 最近 STABILITY_CHECK_BARS 根 15m K 线里没有大阴线（单根跌幅 > STABILITY_BIG_RED_DROP_PCT）
+   *
+   * 返回：
+   * - true: 没有大阴线，价格已经"企稳"，可以买
+   * - false: 有大阴线，正在暴跌中，先观望
+   * - null: 数据不足，无法判定（保守起见，按"不稳定"处理 → 调用方应放弃买入）
+   */
+  private async isPriceStable(address: string): Promise<boolean | null> {
+    const c = await this.getOhlcvCached(address);
+    if (!c || c.candles.length < STABILITY_CHECK_BARS) return null;
+    // 取最近 N 根（包含正在走的当前根）
+    const recent = c.candles.slice(-STABILITY_CHECK_BARS);
+    for (const candle of recent) {
+      if (!candle.o || candle.o <= 0) continue;
+      const dropPct = ((candle.o - candle.c) / candle.o) * 100;
+      // dropPct > 0 = 阴线，dropPct > 阈值 = 大阴线
+      if (dropPct > STABILITY_BIG_RED_DROP_PCT) {
+        logger.debug({
+          address,
+          candleOpen: candle.o,
+          candleClose: candle.c,
+          dropPct: dropPct.toFixed(1),
+        }, '价格不稳：发现大阴线');
+        return false;
+      }
     }
-    const value = rsi(closes, 7);
-    this.rsiCache.set(address, { rsi7: value, fetchedAt: Date.now() });
-    return value;
+    return true;
   }
 
   // ============== FDV/LP 巡检 ==============

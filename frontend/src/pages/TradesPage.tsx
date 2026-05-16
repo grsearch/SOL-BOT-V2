@@ -50,7 +50,17 @@ export function TradesPage() {
               {trades.map((t) => (
                 <tr key={t.id} className="border-t border-border hover:bg-panel2/40">
                   <td className="p-3 text-xs text-muted">{fmtTime(t.created_at)}</td>
-                  <td className="p-3 font-mono text-xs">{shortAddr(t.token_address)}</td>
+                  <td className="p-3 font-mono text-xs">
+                    <a
+                      href={`https://gmgn.ai/sol/token/${t.token_address}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-accent hover:underline"
+                      title={t.token_address}
+                    >
+                      {shortAddr(t.token_address)}
+                    </a>
+                  </td>
                   <td className={`p-3 font-medium ${t.side === 'buy' ? 'text-green' : 'text-red'}`}>{t.side === 'buy' ? '买入' : '卖出'}</td>
                   <td className="p-3 text-xs text-muted">{triggerLabel(t.trigger)}</td>
                   <td className="p-3 text-right font-mono">{t.in_amount_ui.toFixed(t.in_mint === 'So11111111111111111111111111111111111111112' ? 4 : 2)}</td>
@@ -83,6 +93,9 @@ function triggerLabel(trigger: string): string {
     case 'manual': return '手动';
     case 'auto_take_profit': return '自动止盈';
     case 'auto_remove_sell': return '自动移除';
+    case 'auto_dip_buy': return '逢低买入';
+    case 'auto_dip_buy_dca': return 'DCA 补仓';
+    case 'auto_rsi_sell': return 'RSI 卖出';
     default: return trigger;
   }
 }
